@@ -178,6 +178,203 @@ def test_create_launch_template_version__dryrun():
     assert_dryrun_error(exc)
 
 
+@mock_aws
+@pytest.mark.parametrize("selector", ["LaunchTemplateId", "LaunchTemplateName"])
+def test_delete_launch_template_versions_preserves_version_numbers(selector):
+    client = boto3.client("ec2", region_name="us-east-1")
+    template = client.create_launch_template(
+        LaunchTemplateName=str(uuid4()),
+        LaunchTemplateData={"ImageId": "ami-00000001"},
+    )["LaunchTemplate"]
+    selected = {selector: template[selector]}
+    for number in range(2, 11):
+        client.create_launch_template_version(
+            **selected, LaunchTemplateData={"ImageId": f"ami-{number:08x}"}
+        )
+    client.modify_launch_template(**selected, DefaultVersion="3")
+    response = client.delete_launch_template_versions(
+        **selected, Versions=["2", "3", "4", "99"]
+    )
+    assert response["SuccessfullyDeletedLaunchTemplateVersions"] == [
+        {
+            "LaunchTemplateId": template["LaunchTemplateId"],
+            "LaunchTemplateName": template["LaunchTemplateName"],
+            "VersionNumber": number,
+        }
+        for number in (2, 4)
+    ]
+    unsuccessful = response["UnsuccessfullyDeletedLaunchTemplateVersions"]
+    assert [row["VersionNumber"] for row in unsuccessful] == [3, 99]
+    assert "default" in unsuccessful[0]["ResponseError"]["Message"]
+    assert (
+        unsuccessful[1]["ResponseError"]["Code"] == "launchTemplateVersionDoesNotExist"
+    )
+    versions = client.describe_launch_template_versions(**selected)[
+        "LaunchTemplateVersions"
+    ]
+    assert [version["VersionNumber"] for version in versions] == [
+        1,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ]
+    assert [version["LaunchTemplateData"]["ImageId"] for version in versions] == [
+        f"ami-{number:08x}" for number in (1, 3, 5, 6, 7, 8, 9, 10)
+    ]
+    assert [
+        row["VersionNumber"]
+        for row in client.describe_launch_template_versions(
+            **selected, Versions=["$Default", "$Latest", "5"]
+        )["LaunchTemplateVersions"]
+    ] == [3, 10, 5]
+    assert [
+        row["VersionNumber"]
+        for row in client.describe_launch_template_versions(
+            **selected, MinVersion="2", MaxVersion="10", MaxResults=5
+        )["LaunchTemplateVersions"]
+    ] == [3, 5, 6, 7, 8]
+    for deleted in ("2", "4", "0", "-1"):
+        with pytest.raises(ClientError) as caught:
+            client.describe_launch_template_versions(**selected, Versions=[deleted])
+        assert (
+            caught.value.response["Error"]["Code"]
+            == "InvalidLaunchTemplateId.VersionNotFound"
+        )
+
+    client.delete_launch_template_versions(**selected, Versions=["10"])
+    latest = client.describe_launch_template_versions(**selected, Versions=["$Latest"])[
+        "LaunchTemplateVersions"
+    ][0]
+    assert latest["VersionNumber"] == 9
+    description = client.describe_launch_templates(
+        LaunchTemplateIds=[template["LaunchTemplateId"]]
+    )["LaunchTemplates"][0]
+    assert description["LatestVersionNumber"] == 9
+    assert description["DefaultVersionNumber"] == 3
+    # Removing the highest version must not make its number available again.
+    created = client.create_launch_template_version(
+        **selected, LaunchTemplateData={"ImageId": "ami-0000000b"}
+    )["LaunchTemplateVersion"]
+    assert created["VersionNumber"] == 11
+    client.delete_launch_template_versions(**selected, Versions=["11"])
+    assert (
+        client.create_launch_template_version(
+            **selected, LaunchTemplateData={"ImageId": "ami-0000000c"}
+        )["LaunchTemplateVersion"]["VersionNumber"]
+        == 12
+    )
+    repeated = client.delete_launch_template_versions(**selected, Versions=["2"])
+    assert repeated["SuccessfullyDeletedLaunchTemplateVersions"] == []
+    assert (
+        repeated["UnsuccessfullyDeletedLaunchTemplateVersions"][0]["ResponseError"][
+            "Code"
+        ]
+        == "launchTemplateVersionDoesNotExist"
+    )
+
+
+@mock_aws
+def test_delete_launch_template_versions_dryrun_and_validation_do_not_mutate():
+    client = boto3.client("ec2", region_name="us-east-1")
+    template = client.create_launch_template(
+        LaunchTemplateName=str(uuid4()), LaunchTemplateData={"ImageId": "ami-00000001"}
+    )["LaunchTemplate"]
+    selected = {"LaunchTemplateId": template["LaunchTemplateId"]}
+    client.create_launch_template_version(
+        **selected, LaunchTemplateData={"ImageId": "ami-00000002"}
+    )
+    with pytest.raises(ClientError) as caught:
+        client.delete_launch_template_versions(**selected, Versions=["2"], DryRun=True)
+    assert_dryrun_error(caught)
+    for versions in ([], ["2", "0"], ["2", "-1"], ["2", "$Latest"], ["2"] * 201):
+        with pytest.raises(ClientError):
+            client.delete_launch_template_versions(**selected, Versions=versions)
+    with pytest.raises(ClientError) as caught:
+        client.delete_launch_template_versions(
+            **selected,
+            LaunchTemplateName=template["LaunchTemplateName"],
+            Versions=["2"],
+        )
+    assert caught.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    with pytest.raises(ClientError) as caught:
+        client.delete_launch_template_versions(Versions=["2"])
+    assert caught.value.response["Error"]["Code"] == "MissingParameter"
+    assert [
+        row["VersionNumber"]
+        for row in client.describe_launch_template_versions(**selected)[
+            "LaunchTemplateVersions"
+        ]
+    ] == [1, 2]
+
+
+@mock_aws
+@pytest.mark.parametrize(
+    "selected,code",
+    [
+        ({"LaunchTemplateId": "lt-00000000000000000"}, "launchTemplateIdDoesNotExist"),
+        ({"LaunchTemplateId": "invalid"}, "launchTemplateIdMalformed"),
+        ({"LaunchTemplateName": "missing-template"}, "launchTemplateNameDoesNotExist"),
+        ({"LaunchTemplateName": "invalid name"}, "launchTemplateNameMalformed"),
+    ],
+)
+def test_delete_launch_template_versions_reports_template_errors_per_version(
+    selected, code
+):
+    client = boto3.client("ec2", region_name="us-east-1")
+    response = client.delete_launch_template_versions(**selected, Versions=["1", "2"])
+    assert response["SuccessfullyDeletedLaunchTemplateVersions"] == []
+    failed = response["UnsuccessfullyDeletedLaunchTemplateVersions"]
+    assert [row["VersionNumber"] for row in failed] == [1, 2]
+    assert all(row["ResponseError"]["Code"] == code for row in failed)
+    assert all(
+        all(row[key] == value for key, value in selected.items()) for row in failed
+    )
+
+
+@mock_aws
+def test_delete_launch_template_versions_is_scoped():
+    client = boto3.client("ec2", region_name="us-east-1")
+    template = client.create_launch_template(
+        LaunchTemplateName=str(uuid4()), LaunchTemplateData={"ImageId": "ami-00000001"}
+    )["LaunchTemplate"]
+    selected = {"LaunchTemplateId": template["LaunchTemplateId"]}
+    client.create_launch_template_version(
+        **selected, LaunchTemplateData={"ImageId": "ami-00000002"}
+    )
+    other_region = boto3.client("ec2", region_name="us-west-2")
+    failed = other_region.delete_launch_template_versions(**selected, Versions=["2"])
+    assert (
+        failed["UnsuccessfullyDeletedLaunchTemplateVersions"][0]["ResponseError"][
+            "Code"
+        ]
+        == "launchTemplateIdDoesNotExist"
+    )
+    other_account = boto3.client("ec2", region_name="us-east-1")
+    other_account.meta.events.register(
+        "before-send.ec2",
+        lambda request, **kwargs: request.headers.update(
+            {"x-moto-account-id": "111111111111"}
+        ),
+    )
+    failed = other_account.delete_launch_template_versions(**selected, Versions=["2"])
+    assert (
+        failed["UnsuccessfullyDeletedLaunchTemplateVersions"][0]["ResponseError"][
+            "Code"
+        ]
+        == "launchTemplateIdDoesNotExist"
+    )
+    assert (
+        client.describe_launch_template_versions(**selected, Versions=["2"])[
+            "LaunchTemplateVersions"
+        ][0]["VersionNumber"]
+        == 2
+    )
+
+
 @ec2_aws_verified(create_launch_template=True, return_launch_template_details=True)
 @pytest.mark.aws_verified
 def test_create_launch_template_version_by_id(

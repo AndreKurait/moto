@@ -336,7 +336,7 @@ def test_delete_launch_template_versions_reports_template_errors_per_version(
 
 
 @mock_aws
-def test_delete_launch_template_versions_is_scoped(monkeypatch):
+def test_delete_launch_template_versions_is_scoped():
     client = boto3.client("ec2", region_name="us-east-1")
     template = client.create_launch_template(
         LaunchTemplateName=str(uuid4()), LaunchTemplateData={"ImageId": "ami-00000001"}
@@ -353,18 +353,20 @@ def test_delete_launch_template_versions_is_scoped(monkeypatch):
         ]
         == "launchTemplateIdDoesNotExist"
     )
-    with monkeypatch.context() as account:
-        account.setenv("MOTO_ACCOUNT_ID", "111111111111")
-        other_account = boto3.client("ec2", region_name="us-east-1")
-        failed = other_account.delete_launch_template_versions(
-            **selected, Versions=["2"]
-        )
-        assert (
-            failed["UnsuccessfullyDeletedLaunchTemplateVersions"][0]["ResponseError"][
-                "Code"
-            ]
-            == "launchTemplateIdDoesNotExist"
-        )
+    other_account = boto3.client("ec2", region_name="us-east-1")
+    other_account.meta.events.register(
+        "before-send.ec2",
+        lambda request, **kwargs: request.headers.update(
+            {"x-moto-account-id": "111111111111"}
+        ),
+    )
+    failed = other_account.delete_launch_template_versions(**selected, Versions=["2"])
+    assert (
+        failed["UnsuccessfullyDeletedLaunchTemplateVersions"][0]["ResponseError"][
+            "Code"
+        ]
+        == "launchTemplateIdDoesNotExist"
+    )
     assert (
         client.describe_launch_template_versions(**selected, Versions=["2"])[
             "LaunchTemplateVersions"

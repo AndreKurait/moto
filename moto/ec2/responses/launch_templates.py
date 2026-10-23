@@ -100,6 +100,21 @@ class LaunchTemplates(EC2BaseResponse):
 
         return ActionResult(result)
 
+    def delete_launch_template_versions(self) -> ActionResult:
+        name = self._get_param("LaunchTemplateName")
+        template_id = self._get_param("LaunchTemplateId")
+        versions = self._get_param("Versions", [])
+        self.error_on_dryrun()
+        successful, unsuccessful = self.ec2_backend.delete_launch_template_versions(
+            name, template_id, versions
+        )
+        return ActionResult(
+            {
+                "SuccessfullyDeletedLaunchTemplateVersions": successful,
+                "UnsuccessfullyDeletedLaunchTemplateVersions": unsuccessful,
+            }
+        )
+
     def describe_launch_template_versions(self) -> ActionResult:
         name = self._get_param("LaunchTemplateName")
         template_id = self._get_param("LaunchTemplateId")
